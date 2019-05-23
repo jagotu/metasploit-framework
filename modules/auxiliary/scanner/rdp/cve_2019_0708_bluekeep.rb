@@ -116,6 +116,16 @@ class MetasploitModule < Msf::Auxiliary
     return pkt
   end
 
+  def asn_get_index(asnobject, index)
+    asnobject.each do |asn1|
+      if index == 0
+        return asn1
+      end
+      index = index-1
+    end
+  end
+
+
   # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/9cde84cd-5055-475a-ac8b-704db419b66f
   def pdu_security_exchange(rcran, rsexp, rsmod, bitlen)
     encrypted_rcran_bignum = rsa_encrypt(rcran, rsexp, rsmod)
@@ -173,6 +183,7 @@ class MetasploitModule < Msf::Auxiliary
   # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/927de44c-7fe8-4206-a14f-e5517dc24b1c
   def rdp_parse_serverdata(pkt)
     ptr = 0
+    vprint_status("pkt length #{pkt.length}")
     rdp_pkt = pkt[0x49..pkt.length]
 
     while ptr < rdp_pkt.length
@@ -184,21 +195,81 @@ class MetasploitModule < Msf::Auxiliary
       if header_type == "\x02\x0c"
         vprint_status("security header")
 
-        server_random = rdp_pkt[ptr+20..ptr+51]
-        public_exponent = rdp_pkt[ptr+84..ptr+87]
+        cert_type = rdp_pkt[ptr+52..ptr+55].unpack("L<")[0] & 0x7FFFFFFF
+        vprint_status("cert type #{cert_type}")
 
-        modulus = rdp_pkt[ptr+88..ptr+151]
-        vprint_status("modulus_old #{bin_to_hex(modulus)}")
-        rsa_magic = rdp_pkt[ptr+68..ptr+71]
-        if rsa_magic != "RSA1"
-          print_error("Server cert isn't RSA, this scenario isn't supported (yet).")
+        server_random = rdp_pkt[ptr+20..ptr+51]
+
+        if cert_type == 1 #RSA
+          public_exponent = rdp_pkt[ptr+84..ptr+87]
+          rsa_magic = rdp_pkt[ptr+68..ptr+71]
+          if rsa_magic != "RSA1"
+            print_error("Server claimed to be RSA, but isn't!")
+            raise RdpCommunicationError
+          end
+          vprint_status("RSA magic: #{rsa_magic}")
+          bitlen = rdp_pkt[ptr+72..ptr+75].unpack("L<")[0] - 8
+          vprint_status("RSA bitlen: #{bitlen}")
+          modulus = rdp_pkt[ptr+88..ptr+87+bitlen]
+          vprint_status("modulus_new #{bin_to_hex(modulus)}")
+
+
+          rsmod = bytes_to_bignum(modulus)
+          rsexp = bytes_to_bignum(public_exponent)
+        elsif cert_type == 2 #X509
+          cert_count = rdp_pkt[ptr+56..ptr+59].unpack("L<")[0]
+          local_ptr = ptr+60
+
+          for i in 2..cert_count
+            cert_length = rdp_pkt[local_ptr..local_ptr+3].unpack("L<")[0]
+            
+            local_ptr += cert_length + 4
+          end
+
+          last_cert_length = rdp_pkt[local_ptr..local_ptr+3].unpack("L<")[0]
+          vprint_status("last cert length #{last_cert_length}")
+          last_cert = rdp_pkt[local_ptr+4..local_ptr+3+last_cert_length]
+
+          certificate = OpenSSL::X509::Certificate.new(last_cert)
+          begin
+
+            public_key = certificate.public_key.params
+
+            rsexp = public_key["e"].to_i()
+            rsmod = public_key["n"].to_i()
+
+          
+            bitlen = public_key["n"].num_bytes
+          rescue 
+            # MS stupid cert, need to parse manually
+            asn1cert = OpenSSL::ASN1.decode(last_cert)
+            asn = asn_get_index(asn1cert, 0)
+            asn = asn_get_index(asn, 6)
+
+            alg = asn_get_index(asn, 0)
+            alg = asn_get_index(alg, 0)
+
+            if alg.value != 'RSA-SHA' && alg.value != 'RSA-MD5'
+              print_error("Unknown x509 algo #{alg.value}")
+              raise RdpCommunicationError
+            end
+
+            pkey_der = asn_get_index(asn, 1).value
+            pkey_asn = OpenSSL::ASN1.decode(pkey_der)
+            rsmod = asn_get_index(pkey_asn, 0).value.to_i()
+            rsexp = asn_get_index(pkey_asn, 1).value.to_i()
+
+            bitlen = asn_get_index(pkey_asn, 0).value.num_bytes
+
+          end
+        
+        else
+          print_error("Unknown cert type #{cert_type}")
           raise RdpCommunicationError
         end
-        vprint_status("RSA magic: #{rsa_magic}")
-        bitlen = rdp_pkt[ptr+72..ptr+75].unpack("L<")[0] - 8
-        vprint_status("RSA bitlen: #{bitlen}")
-        modulus = rdp_pkt[ptr+88..ptr+87+bitlen]
-        vprint_status("modulus_new #{bin_to_hex(modulus)}")
+
+
+
 
 
       end
@@ -207,13 +278,13 @@ class MetasploitModule < Msf::Auxiliary
       ptr += header_length
     end
 
-    vprint_status("SERVER_MODULUS: #{bin_to_hex(modulus)}")
-    vprint_status("SERVER_EXPONENT: #{bin_to_hex(public_exponent)}")
-    vprint_status("SERVER_RANDOM: #{bin_to_hex(server_random)}")
-
-    rsmod = bytes_to_bignum(modulus)
-    rsexp = bytes_to_bignum(public_exponent)
     rsran = bytes_to_bignum(server_random)
+
+    vprint_status("SERVER_MODULUS: #{rsmod}")
+    vprint_status("SERVER_EXPONENT: #{rsexp}")
+    vprint_status("SERVER_RANDOM: #{bin_to_hex(server_random)}")
+    vprint_status("BITLEN: #{bitlen}")
+
 
     #vprint_status("MODULUS  = #{bin_to_hex(modulus)} - #{rsmod.to_s}")
     #vprint_status("EXPONENT = #{bin_to_hex(public_exponent)} - #{rsexp.to_s}")
@@ -239,6 +310,21 @@ class MetasploitModule < Msf::Auxiliary
     res2 = sock.get_once(res1[2..4].unpack("S>")[0], 5)
     raise RdpCommunicationError unless res2 # nil due to a timeout
     res1 + res2
+  end
+
+  def rdp_recv_full()
+    res1 = sock.get_once(4, 5)
+    raise RdpCommunicationError unless res1 # nil due to a timeout
+    count = res1[2..4].unpack("S>")[0] - 4
+    total_data = ""
+    while count > 0
+      data = sock.get_once(count, 5)
+      raise RdpCommunicationError unless data # nil due to a timeout
+      count -= data.length
+      total_data << data
+    end
+    
+    res1 + total_data
   end
 
   def rdp_send_recv(data)
@@ -311,7 +397,8 @@ class MetasploitModule < Msf::Auxiliary
     end
 
     # send initial client data
-    res = rdp_send_recv(pdu_connect_initial)
+    rdp_send(pdu_connect_initial)
+    res = rdp_recv_full()
     rsmod, rsexp, rsran, server_rand, bitlen = rdp_parse_serverdata(res)
 
     # erect domain and attach user
@@ -350,6 +437,13 @@ class MetasploitModule < Msf::Auxiliary
     res = rdp_send_recv(rdp_encrypted_pkt(pdu_client_info(), rc4enckey, hmackey, "\x48\x00"))
 
     vprint_status("Received License packet: #{bin_to_hex(res)}")
+
+    license_packet_type = res[19].unpack("C")[0]
+    vprint_status("License packet type #{license_packet_type}")
+    if license_packet_type == 1
+      vprint_error("Server requested licensing exchange, which is not implemented (yet)")
+      raise RdpCommunicationError
+    end
 
     res = rdp_recv()
     vprint_status("Received Server Demand packet: #{bin_to_hex(res)}")
